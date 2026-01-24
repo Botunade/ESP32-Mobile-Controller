@@ -75,8 +75,49 @@ The `PROJECT_STATUS.md` claims a `mobile-app/` exists and is a React Native Expo
 -   **Heap Fragmentation:** Frequent use of `String` concatenation in `logSystem` and `setPump` (for logging) could lead to fragmentation over long runtimes.
 -   **Blocking Operations:** `readDistanceMedian` uses `delay(10)` inside a loop. While small, excessive blocking in the main loop can affect network responsiveness, though standard ESP32 async handling usually mitigates this.
 
-## Recommendations
-1.  **Fix API Mismatch:** Update `desktop-app` to send keys matching firmware expectations (`target_setpoint`, `start_level`, `stop_level`) OR update firmware to accept `setpoint`/`lower_limit` aliases.
-2.  **Implement Geometry Config:** Add handling for `tank_height_cm`, `min_distance_cm`, `max_distance_cm` in firmware's `handleConfig` POST handler.
-3.  **Clean up Pin Config:** Remove conflicting comments in `config.h`.
-4.  **Clarify Mobile App Status:** Update documentation to reflect the current state (missing folder) or locate the missing files.
+## 5. Firmware Workflow Analysis (`firmware/src/main.cpp`)
+
+This section details the execution flow of the main firmware file.
+
+### A. Initialization Phase (`setup()`)
+The `setup()` function runs once on boot:
+1.  **Serial Console:** Initializes UART at 115200 baud.
+2.  **Filesystem (LittleFS):** Mounts the filesystem; formats it if mounting fails.
+3.  **Persistence Load:** Reads stored config (tank height, PID gains, setpoints) from Non-Volatile Storage (NVS) using `Preferences`.
+4.  **Hardware Init:** Sets pin modes for Ultrasonic Sensor (Trig/Echo), Pump Relay, and Analog Output.
+5.  **WiFi Manager:**
+    -   Starts an Access Point (`TankLogic-Setup`) if no known WiFi is found.
+    -   Displays a captive portal allowing the user to configure WiFi credentials and custom parameters (Tank Depth, Sensor Gap, Setpoint).
+    -   Saves new parameters to NVS if changed.
+6.  **External Services:**
+    -   **Firebase:** Authenticates and begins the Realtime Database connection.
+    -   **BLE:** Initializes the BLE Server (`Tank Logic Pro`) and Services (Status & Control characteristics).
+    -   **WebServer:** Registers HTTP endpoints (`/`, `/status`, `/config`, etc.) and starts the server.
+    -   **mDNS:** Sets up `tank-controller.local` resolution.
+7.  **Watchdog:** Initializes the Task Watchdog Timer (60s timeout).
+
+### B. Main Execution Loop (`loop()`)
+The `loop()` function runs continuously:
+1.  **Safety Checks:**
+    -   Resets the Watchdog Timer.
+    -   Checks the physical BOOT button (GPIO 0). If held for 3 seconds, performs a Factory Reset (wipes WiFi settings).
+2.  **WebServer Handling:** Processes any incoming HTTP client requests.
+3.  **Control Cycle (Every 500ms):**
+    -   **Sensor Reading:** Reads water level via Ultrasonic sensor (median of 5 samples). Returns `-1.0` if invalid.
+    -   **Safety Logic:** If reading is invalid, turns Pump OFF and sets Analog Output to 0V.
+    -   **Control Logic (Valid Reading):**
+        -   **Pump (Hysteresis):**
+            -   Stops pump if level >= `pumpStopLevel`.
+            -   Starts pump if level <= `pumpStartLevel`.
+        -   **Valve (PID):**
+            -   Calculates PID output based on `targetLevelPercent` vs `currentLevel`.
+            -   Writes result to Analog DAC Output.
+    -   **Cloud Sync (Firebase):**
+        -   **Push:** Uploads current status (Level, PID, Pump state, etc.) to `/tank/status`.
+        -   **Pull:** Downloads configuration from `/tank` (Control, Config, PID tunings) and updates local variables/NVS if changed.
+    -   **BLE Notify:** Updates the BLE Status Characteristic with the latest level and pump state.
+
+### C. Critical Logic Notes
+-   **Blocking Delay:** The ultrasonic reading (`readDistanceMedian`) introduces a delay of ~50ms (5 samples * 10ms delay). This occurs every 500ms.
+-   **Firebase Batching:** Firebase operations are batched to occur only once every 500ms to avoid network congestion.
+-   **Priority:** Local safety logic (pump deadband) runs *before* cloud sync, ensuring the system reacts to water levels even if the internet is lost.
