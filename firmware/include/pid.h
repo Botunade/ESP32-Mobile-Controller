@@ -5,8 +5,9 @@
 
 class PIDController {
 public:
-    PIDController(float kp, float ki, float kd) 
-        : kp(kp), ki(ki), kd(kd), integral(0), prevError(0) {}
+    // Constructor with optional limits (default 0-100 for percentage)
+    PIDController(float kp, float ki, float kd, float minLimit = 0.0f, float maxLimit = 100.0f)
+        : kp(kp), ki(ki), kd(kd), minOut(minLimit), maxOut(maxLimit), integral(0), prevError(0) {}
 
     float compute(float setpoint, float measured, float dtSeconds) {
         float error = setpoint - measured;
@@ -16,6 +17,12 @@ public:
 
         // Integral term
         integral += error * dtSeconds;
+
+        // Anti-windup: Clamp integral contribution indirectly via output clamping logic below
+        // or prevent integral accumulation if saturated.
+        // Here we use a standard clamping on the calculated I-term for stability
+        // relative to output limits.
+
         float I = ki * integral;
 
         // Derivative term
@@ -24,8 +31,21 @@ public:
 
         prevError = error;
 
-        // Output = P + I + D
-        return P + I + D;
+        // Calculate total output
+        float output = P + I + D;
+
+        // Output Clamping and Anti-Windup
+        if (output > maxOut) {
+            output = maxOut;
+            // Prevent integral from growing in the same direction
+            if (error > 0) integral -= error * dtSeconds;
+        } else if (output < minOut) {
+            output = minOut;
+            // Prevent integral from growing in the same direction
+            if (error < 0) integral -= error * dtSeconds;
+        }
+
+        return output;
     }
 
     void reset() {
@@ -39,10 +59,17 @@ public:
         this->kd = kd;
     }
 
+    void setOutputLimits(float min, float max) {
+        minOut = min;
+        maxOut = max;
+    }
+
 private:
     float kp;
     float ki;
     float kd;
+    float minOut;
+    float maxOut;
     float integral;
     float prevError;
 };

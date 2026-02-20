@@ -13,7 +13,6 @@
 #define ULTRASONIC_TRIG_PIN 5
 #define ULTRASONIC_ECHO_PIN 18
 
-// Relay output to pump (GPIO 2 / D2)
 // Relay output to pump (GPIO 16)
 #define PUMP_RELAY_PIN 16
 
@@ -31,11 +30,6 @@
 
 // ========== CONTROL TIMING ==========
 #define CONTROL_INTERVAL_MS 500      // Run logic every 500 ms
-
-// ========== BLE CONFIGURATION ==========
-#define BLE_SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
-#define BLE_CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8" // For status (Read/Notify)
-#define BLE_CONTROL_UUID        "885f8386-3532-4048-8167-25e21508246d" // For commands (Write)
 
 // ========== PID CONTROL ==========
 #define PID_KP 2.0f

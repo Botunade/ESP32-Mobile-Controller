@@ -6,14 +6,12 @@
 #include <WebServer.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
-#include <BLEDevice.h>
-#include <BLEServer.h>
-#include <BLEUtils.h>
-#include <BLE2902.h>
 #include <LittleFS.h>
 #include <vector>
 #include <algorithm>
 #include <Firebase_ESP_Client.h>
+#include <Update.h>
+#include <HTTPClient.h>
 #include "secrets.h"
 #include "config.h"
 #include "pid.h"
@@ -33,13 +31,9 @@ unsigned long lastFirebaseSend = 0;
 // ========== GLOBAL RUNTIME VARIABLES ==========
 
 // Primary Control Parameters
-float targetLevelPercent = 50.0f;           // Valve Target (PID)
-float pumpStopLevel = DEFAULT_SETPOINT;     // Upper Cut-off (Pump)
-float pumpStartLevel = DEFAULT_LOWER_LIMIT; // Lower Turn-on (Pump)
-
-// Legacy compatibility (Ensures dashboard v0.4.0 and earlier don't break)
-float setpointPercent = DEFAULT_SETPOINT;
-float lowerLimitPercent = DEFAULT_LOWER_LIMIT;
+float targetLevelPercent = DEFAULT_SETPOINT;
+float pumpStopLevel = DEFAULT_SETPOINT;
+float pumpStartLevel = DEFAULT_LOWER_LIMIT;
 
 // Transient State
 bool pumpOn = false;
@@ -52,11 +46,15 @@ float tankHeightCm = TANK_HEIGHT_CM;
 float minDistanceCm = MIN_DISTANCE_CM;
 float maxDistanceCm = MAX_DISTANCE_CM;
 
+// AP Mode Toggle
+bool alwaysOnAp = false;
+
 // PID Controller Settings
 float currentKp = PID_KP;
 float currentKi = PID_KI;
 float currentKd = PID_KD;
-PIDController pid(PID_KP, PID_KI, PID_KD);
+// Initialize PID with 0-100% output limits
+PIDController pid(PID_KP, PID_KI, PID_KD, 0.0f, 100.0f);
 
 // DAC Output Settings (8-bit: 0-255)
 int currentDacMin = DAC_MIN_VAL;
@@ -92,11 +90,59 @@ void saveConfigCallback()
     shouldSaveConfig = true;
 }
 
-// BLE (Bluetooth) Context
-BLEServer *pServer = NULL;
-BLECharacteristic *pStatusCharacteristic = NULL;
-BLECharacteristic *pControlCharacteristic = NULL;
-bool deviceConnected = false;
+// ---------- FIRMWARE UPDATE (OTA) ----------
+
+void performOTA(String url) {
+    if (url.length() == 0) return;
+
+    logSystem("Starting OTA Update...");
+    // Disable safety WDT or reset it frequently, OTA takes time
+    esp_task_wdt_delete(NULL);
+
+    WiFiClient client;
+    HTTPClient http;
+    http.begin(client, url);
+    int httpCode = http.GET();
+
+    if (httpCode == HTTP_CODE_OK) {
+        int contentLength = http.getSize();
+        bool canBegin = Update.begin(contentLength);
+
+        if (canBegin) {
+            logSystem("Writing Firmware...");
+            WiFiClient *stream = http.getStreamPtr();
+            size_t written = Update.writeStream(*stream);
+
+            if (written == contentLength) {
+                logSystem("OTA Write Done. Verifying...");
+                if (Update.end()) {
+                    if (Update.isFinished()) {
+                        logSystem("OTA Success! Rebooting...");
+                        // Clear the update flag in DB to prevent loop
+                        Firebase.RTDB.setString(&fbdo, "/tank/firmware/update_url", "");
+                        delay(1000);
+                        ESP.restart();
+                    } else {
+                        logSystem("OTA Failed: Not Finished");
+                    }
+                } else {
+                    logSystem("OTA Error: " + String(Update.getError()));
+                }
+            } else {
+                logSystem("OTA Write Failed: Short Write");
+            }
+        } else {
+            logSystem("OTA Init Failed: Not enough space");
+        }
+    } else {
+        logSystem("OTA HTTP Failed: " + String(httpCode));
+    }
+    http.end();
+
+    // Re-enable WDT if failed
+    esp_task_wdt_init(WDT_TIMEOUT, true);
+    esp_task_wdt_add(NULL);
+}
 
 // ---------- ANALYTICS & DIAGNOSTICS ----------
 
@@ -123,6 +169,42 @@ float clampValue(float x, float minVal, float maxVal)
     if (x < minVal) return minVal;
     if (x > maxVal) return maxVal;
     return x;
+}
+
+// Helper to unify parameter updates
+void updateTargetSetpoint(float v) {
+    v = clampValue(v, 0.0f, 100.0f);
+    if (abs(targetLevelPercent - v) > 0.1f) {
+        targetLevelPercent = v;
+        preferences.putFloat("targetSetpoint", v);
+        logSystem("Target Setpoint Updated: " + String(v, 1));
+    }
+}
+
+void updatePumpStartLevel(float v) {
+    v = clampValue(v, 0.0f, 100.0f);
+    if (abs(pumpStartLevel - v) > 0.1f) {
+        pumpStartLevel = v;
+        preferences.putFloat("startLevel", v);
+        logSystem("Pump Start Level Updated: " + String(v, 1));
+    }
+}
+
+void updatePumpStopLevel(float v) {
+    v = clampValue(v, 0.0f, 100.0f);
+    if (abs(pumpStopLevel - v) > 0.1f) {
+        pumpStopLevel = v;
+        preferences.putFloat("stopLevel", v);
+        logSystem("Pump Stop Level Updated: " + String(v, 1));
+    }
+}
+
+void updateTankHeight(float v) {
+    if (v > 0 && abs(tankHeightCm - v) > 0.1f) {
+        tankHeightCm = v;
+        preferences.putFloat("tankHeight", v);
+        logSystem("Tank Height Updated: " + String(v, 1));
+    }
 }
 
 void sendJson(WebServer &srv, JsonDocument &doc, int statusCode = 200)
@@ -198,63 +280,15 @@ void setPump(bool on)
 
 void updateAnalogOutput(float pidOutputPercent)
 {
-    int dacValue = (int)map((long)pidOutputPercent, 0, 100, currentDacMin, currentDacMax);
+    // Map 0-100% to DAC_MIN (0.66V) - DAC_MAX (3.3V)
+    // Using float math for better precision before casting
+    float range = (float)(currentDacMax - currentDacMin);
+    float val = (float)currentDacMin + (pidOutputPercent / 100.0f) * range;
+
+    int dacValue = (int)val;
     dacValue = constrain(dacValue, currentDacMin, currentDacMax);
     dacWrite(ANALOG_OUTPUT_PIN, dacValue);
 }
-
-// ---------- BLE INTERFACE CALLBACKS ----------
-
-class MyServerCallbacks : public BLEServerCallbacks
-{
-    void onConnect(BLEServer *pServer)
-    {
-        deviceConnected = true;
-        Serial.println("[BLE] Client Linked");
-    };
-    void onDisconnect(BLEServer *pServer)
-    {
-        deviceConnected = false;
-        Serial.println("[BLE] Client Unlinked");
-    }
-};
-
-class MyControlCallbacks : public BLECharacteristicCallbacks
-{
-    void onWrite(BLECharacteristic *pCharacteristic)
-    {
-        String incoming = pCharacteristic->getValue().c_str();
-        if (incoming.length() > 0)
-        {
-            StaticJsonDocument<512> packet;
-            if (deserializeJson(packet, incoming)) return;
-
-            if (packet.containsKey("target_setpoint"))
-            {
-                targetLevelPercent = clampValue(packet["target_setpoint"], 0.0f, 100.0f);
-                setpointPercent = targetLevelPercent;
-                preferences.putFloat("targetSetpoint", targetLevelPercent);
-            }
-            if (packet.containsKey("stop_level"))
-            {
-                pumpStopLevel = clampValue(packet["stop_level"], 0.0f, 100.0f);
-                preferences.putFloat("stopLevel", pumpStopLevel);
-            }
-            if (packet.containsKey("start_level"))
-            {
-                pumpStartLevel = clampValue(packet["start_level"], 0.0f, 100.0f);
-                lowerLimitPercent = pumpStartLevel;
-                preferences.putFloat("startLevel", pumpStartLevel);
-            }
-            if (packet.containsKey("tank_height_cm"))
-            {
-                tankHeightCm = packet["tank_height_cm"];
-                preferences.putFloat("tankHeight", tankHeightCm);
-            }
-            logSystem("BLE Local Config Applied");
-        }
-    }
-};
 
 // ---------- HTTP INTERFACE HANDLERS ----------
 
@@ -289,8 +323,10 @@ void handleStatus()
     status["pid_output"] = lastPidOutput;
     status["rssi"] = WiFi.RSSI();
     status["uptime"] = millis() / 1000;
+    status["ap_mode_active"] = alwaysOnAp;
+    status["firmware_version"] = FIRMWARE_VERSION;
 
-    // Aliases
+    // Aliases for compatibility
     status["setpoint_percent"] = targetLevelPercent;
     status["lower_limit"] = pumpStartLevel;
 
@@ -308,6 +344,10 @@ void handleConfig()
         cfg["target_setpoint"] = targetLevelPercent;
         cfg["start_level"] = pumpStartLevel;
         cfg["stop_level"] = pumpStopLevel;
+        // Aliases
+        cfg["setpoint"] = targetLevelPercent;
+        cfg["lower_limit"] = pumpStartLevel;
+
         cfg["kp"] = currentKp;
         cfg["ki"] = currentKi;
         cfg["kd"] = currentKd;
@@ -319,23 +359,15 @@ void handleConfig()
         StaticJsonDocument<512> update;
         deserializeJson(update, server.arg("plain"));
 
-        if (update.containsKey("target_setpoint"))
-        {
-            targetLevelPercent = clampValue(update["target_setpoint"], 0.0f, 100.0f);
-            setpointPercent = targetLevelPercent;
-            preferences.putFloat("targetSetpoint", targetLevelPercent);
-        }
-        if (update.containsKey("start_level"))
-        {
-            pumpStartLevel = clampValue(update["start_level"], 0.0f, 100.0f);
-            lowerLimitPercent = pumpStartLevel;
-            preferences.putFloat("startLevel", pumpStartLevel);
-        }
-        if (update.containsKey("stop_level"))
-        {
-            pumpStopLevel = clampValue(update["stop_level"], 0.0f, 100.0f);
-            preferences.putFloat("stopLevel", pumpStopLevel);
-        }
+        if (update.containsKey("target_setpoint")) updateTargetSetpoint(update["target_setpoint"]);
+        if (update.containsKey("setpoint")) updateTargetSetpoint(update["setpoint"]);
+
+        if (update.containsKey("start_level")) updatePumpStartLevel(update["start_level"]);
+        if (update.containsKey("lower_limit")) updatePumpStartLevel(update["lower_limit"]);
+
+        if (update.containsKey("stop_level")) updatePumpStopLevel(update["stop_level"]);
+
+        if (update.containsKey("tank_height_cm")) updateTankHeight(update["tank_height_cm"]);
 
         StaticJsonDocument<64> ack;
         ack["status"] = "OK";
@@ -348,12 +380,10 @@ void handlePidUpdate()
     if (!server.hasArg("plain")) return;
     StaticJsonDocument<256> pidDoc;
     deserializeJson(pidDoc, server.arg("plain"));
-    if (pidDoc.containsKey("setpoint"))
-    {
-        targetLevelPercent = clampValue(pidDoc["setpoint"], 0.0f, 100.0f);
-        setpointPercent = targetLevelPercent;
-        preferences.putFloat("targetSetpoint", targetLevelPercent);
-    }
+
+    if (pidDoc.containsKey("setpoint")) updateTargetSetpoint(pidDoc["setpoint"]);
+    if (pidDoc.containsKey("lower_limit")) updatePumpStartLevel(pidDoc["lower_limit"]);
+
     StaticJsonDocument<64> ok;
     ok["status"] = "PID Sync Done";
     sendJson(server, ok);
@@ -404,8 +434,7 @@ void setup()
     pumpStartLevel = preferences.getFloat("startLevel", DEFAULT_LOWER_LIMIT);
     targetLevelPercent = preferences.getFloat("targetSetpoint", 50.0f);
 
-    setpointPercent = targetLevelPercent;
-    lowerLimitPercent = pumpStartLevel;
+    alwaysOnAp = preferences.getBool("alwaysOnAp", false);
 
     currentKp = preferences.getFloat("kp", PID_KP);
     currentKi = preferences.getFloat("ki", PID_KI);
@@ -414,6 +443,7 @@ void setup()
     currentDacMax = preferences.getInt("dacMax", DAC_MAX_VAL);
 
     pid.setTunings(currentKp, currentKi, currentKd);
+    pid.setOutputLimits(0.0f, 100.0f);
 
     // 2. Hardware Mapping
     pinMode(ULTRASONIC_TRIG_PIN, OUTPUT);
@@ -422,7 +452,7 @@ void setup()
     pinMode(0, INPUT_PULLUP);
 
     setPump(false);
-    dacWrite(ANALOG_OUTPUT_PIN, currentDacMin);
+    dacWrite(ANALOG_OUTPUT_PIN, 0); // Start at 0V
 
     // 3. WiFi Connectivity
     wm.setSaveConfigCallback(saveConfigCallback);
@@ -431,13 +461,27 @@ void setup()
     char mStr[10]; dtostrf(maxDistanceCm, 1, 1, mStr);
     char tStr[10]; dtostrf(targetLevelPercent, 1, 1, tStr);
 
+    // Create a custom checkbox parameter for AP Mode
+    char apStr[4];
+    if (alwaysOnAp) strcpy(apStr, "1"); else strcpy(apStr, "0");
+
     WiFiManagerParameter custom_h("h", "Tank Depth (cm)", hStr, 6);
     WiFiManagerParameter custom_m("m", "Sensor Gap (cm)", mStr, 6);
     WiFiManagerParameter custom_t("t", "Primary Setpoint (%)", tStr, 6);
+    WiFiManagerParameter custom_ap("ap", "Enable Always-On AP (1=Yes, 0=No)", apStr, 3);
 
     wm.addParameter(&custom_h);
     wm.addParameter(&custom_m);
     wm.addParameter(&custom_t);
+    wm.addParameter(&custom_ap);
+
+    // Initial Mode Set
+    if (alwaysOnAp) {
+        WiFi.mode(WIFI_AP_STA);
+        Serial.println("[BOOT] Mode: AP+STA (Persistent)");
+    } else {
+        Serial.println("[BOOT] Mode: Standard");
+    }
 
     if (!wm.autoConnect("TankLogic-Setup", "tank1234"))
     {
@@ -445,16 +489,43 @@ void setup()
         ESP.restart();
     }
 
+    // Force AP to stay on with defined credentials
+    if (alwaysOnAp || WiFi.getMode() == WIFI_AP_STA) {
+        WiFi.softAP(AP_SSID, AP_PASSWORD);
+        Serial.print("[WIFI] Persistent AP Active: ");
+        Serial.println(WiFi.softAPIP());
+    }
+
+    Serial.print("[WIFI] STA Connected: ");
+    Serial.println(WiFi.localIP());
+
+    // Apply Saved Config
     if (shouldSaveConfig)
     {
-        tankHeightCm = atof(custom_h.getValue());
-        maxDistanceCm = atof(custom_m.getValue());
-        targetLevelPercent = atof(custom_t.getValue());
-        setpointPercent = targetLevelPercent;
+        float h = atof(custom_h.getValue());
+        float m = atof(custom_m.getValue());
+        float t = atof(custom_t.getValue());
+        int apVal = atoi(custom_ap.getValue());
 
-        preferences.putFloat("tankHeight", tankHeightCm);
-        preferences.putFloat("maxDist", maxDistanceCm);
-        preferences.putFloat("targetSetpoint", targetLevelPercent);
+        updateTankHeight(h);
+        if (abs(maxDistanceCm - m) > 0.1f) {
+            maxDistanceCm = m;
+            preferences.putFloat("maxDist", m);
+        }
+        updateTargetSetpoint(t);
+
+        bool newApState = (apVal == 1);
+        if (newApState != alwaysOnAp) {
+            alwaysOnAp = newApState;
+            preferences.putBool("alwaysOnAp", alwaysOnAp);
+            Serial.print("[CONFIG] AP Mode Updated: ");
+            Serial.println(alwaysOnAp ? "ON" : "OFF");
+            // If turning on, enable AP immediately
+            if (alwaysOnAp) {
+                WiFi.mode(WIFI_AP_STA);
+                WiFi.softAP(AP_SSID, AP_PASSWORD);
+            }
+        }
     }
 
     // 4. External Services
@@ -464,24 +535,6 @@ void setup()
         signupOK = true;
     Firebase.begin(&config, &auth);
     Firebase.reconnectWiFi(true);
-
-    BLEDevice::init("Tank Logic Pro");
-    pServer = BLEDevice::createServer();
-    pServer->setCallbacks(new MyServerCallbacks());
-    BLEService *pService = pServer->createService(BLE_SERVICE_UUID);
-
-    pStatusCharacteristic = pService->createCharacteristic(
-        BLE_CHARACTERISTIC_UUID,
-        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_INDICATE);
-    pStatusCharacteristic->addDescriptor(new BLE2902());
-
-    pControlCharacteristic = pService->createCharacteristic(
-        BLE_CONTROL_UUID,
-        BLECharacteristic::PROPERTY_WRITE);
-    pControlCharacteristic->setCallbacks(new MyControlCallbacks());
-
-    pService->start();
-    BLEDevice::startAdvertising();
 
     server.on("/", handleRoot);
     server.on("/status", handleStatus);
@@ -533,10 +586,13 @@ void loop()
         float currentLevel = readLevelPercent();
         if (currentLevel < 0)
         {
-            if (pumpOn)
-                setPump(false);
+            // Sensor Error - Fail Safe
+            if (pumpOn) setPump(false);
             lastLevelPercent = -1.0f;
-            updateAnalogOutput(0.0f);
+
+            // Output 0V for safety
+            dacWrite(ANALOG_OUTPUT_PIN, 0);
+            lastPidOutput = 0.0f;
         }
         else
         {
@@ -552,10 +608,22 @@ void loop()
                 setPump(true);
             }
 
-            // 2. Valve PID Logic
-            float dt = CONTROL_INTERVAL_MS / 1000.0f;
-            lastPidOutput = clampValue(pid.compute(targetLevelPercent, currentLevel, dt), 0.0f, 100.0f);
-            updateAnalogOutput(lastPidOutput);
+            // 2. Valve / Actuator Logic
+            if (!pumpOn)
+            {
+                // Force 0V (absolute zero, not 0.66V minimum)
+                dacWrite(ANALOG_OUTPUT_PIN, 0);
+                lastPidOutput = 0.0f;
+                // Optionally reset PID integral to avoid windup during off-time
+                pid.reset();
+            }
+            else
+            {
+                // Normal Operation: PID Control (0.66V - 3.3V)
+                float dt = CONTROL_INTERVAL_MS / 1000.0f;
+                lastPidOutput = clampValue(pid.compute(targetLevelPercent, currentLevel, dt), 0.0f, 100.0f);
+                updateAnalogOutput(lastPidOutput);
+            }
         }
 
         // 3. Cloud Integration (500ms Pulse - JSON BATCHING OPTIMIZED)
@@ -578,6 +646,7 @@ void loop()
             status.set("dac_min_v", (currentDacMin * 3.3f / 255.0f));
             status.set("dac_max_v", (currentDacMax * 3.3f / 255.0f));
             status.set("tank_height", tankHeightCm);
+            status.set("firmware_version", FIRMWARE_VERSION);
             Firebase.RTDB.updateNode(&fbdo, "/tank/status", &status);
 
             // --- BATCH RECEIVE CONTROL/CONFIG ---
@@ -586,46 +655,49 @@ void loop()
                 FirebaseJson &json = fbdo.jsonObject();
                 FirebaseJsonData data;
 
+                // OTA Trigger Check
+                if (json.get(data, "firmware/update_url") && data.typeNum == FirebaseJson::JSON_STRING)
+                {
+                    String url = data.stringValue;
+                    if (url.length() > 10) {
+                        performOTA(url);
+                    }
+                }
+
                 // Control Pulls
                 if (json.get(data, "control/target_setpoint") && data.typeNum == FirebaseJson::JSON_FLOAT)
-                {
-                    float v = data.floatValue;
-                    if (abs(v - targetLevelPercent) > 0.1) { targetLevelPercent = v; setpointPercent = v; preferences.putFloat("targetSetpoint", v); }
-                }
+                    updateTargetSetpoint(data.floatValue);
+
                 if (json.get(data, "control/stop_level") && data.typeNum == FirebaseJson::JSON_FLOAT)
-                {
-                    float v = data.floatValue;
-                    if (abs(v - pumpStopLevel) > 0.1) { pumpStopLevel = v; preferences.putFloat("stopLevel", v); }
-                }
+                    updatePumpStopLevel(data.floatValue);
+
                 if (json.get(data, "control/start_level") && data.typeNum == FirebaseJson::JSON_FLOAT)
-                {
-                    float v = data.floatValue;
-                    if (abs(v - pumpStartLevel) > 0.1) { pumpStartLevel = v; lowerLimitPercent = v; preferences.putFloat("startLevel", v); }
-                }
+                    updatePumpStartLevel(data.floatValue);
 
                 // Config Profile Pulls
                 if (json.get(data, "config/tank_height") && data.typeNum == FirebaseJson::JSON_FLOAT)
-                {
-                    float v = data.floatValue;
-                    if (abs(v - tankHeightCm) > 0.1) { tankHeightCm = v; preferences.putFloat("tankHeight", v); }
-                }
+                    updateTankHeight(data.floatValue);
 
                 // PID & DAC Tuning Pulls
+                bool tuningsChanged = false;
                 if (json.get(data, "config/pid/kp") && data.typeNum == FirebaseJson::JSON_FLOAT)
                 {
                     float v = data.floatValue;
-                    if (abs(v - currentKp) > 0.001) { currentKp = v; preferences.putFloat("kp", v); pid.setTunings(currentKp, currentKi, currentKd); logSystem("Kp Sync"); }
+                    if (abs(v - currentKp) > 0.001) { currentKp = v; preferences.putFloat("kp", v); tuningsChanged = true; logSystem("Kp Sync"); }
                 }
                 if (json.get(data, "config/pid/ki") && data.typeNum == FirebaseJson::JSON_FLOAT)
                 {
                     float v = data.floatValue;
-                    if (abs(v - currentKi) > 0.001) { currentKi = v; preferences.putFloat("ki", v); pid.setTunings(currentKp, currentKi, currentKd); logSystem("Ki Sync"); }
+                    if (abs(v - currentKi) > 0.001) { currentKi = v; preferences.putFloat("ki", v); tuningsChanged = true; logSystem("Ki Sync"); }
                 }
                 if (json.get(data, "config/pid/kd") && data.typeNum == FirebaseJson::JSON_FLOAT)
                 {
                     float v = data.floatValue;
-                    if (abs(v - currentKd) > 0.001) { currentKd = v; preferences.putFloat("kd", v); pid.setTunings(currentKp, currentKi, currentKd); logSystem("Kd Sync"); }
+                    if (abs(v - currentKd) > 0.001) { currentKd = v; preferences.putFloat("kd", v); tuningsChanged = true; logSystem("Kd Sync"); }
                 }
+
+                if (tuningsChanged) pid.setTunings(currentKp, currentKi, currentKd);
+
                 if (json.get(data, "config/dac/min_volt") && data.typeNum == FirebaseJson::JSON_FLOAT)
                 {
                     float v = data.floatValue;
@@ -650,17 +722,6 @@ void loop()
 
             // Print Local Diagnostics
             printDiagnostics();
-        }
-
-        // Bluetooth Pulse
-        if (deviceConnected)
-        {
-            StaticJsonDocument<128> bDoc;
-            bDoc["level"] = lastLevelPercent;
-            bDoc["pump"] = pumpOn;
-            String out; serializeJson(bDoc, out);
-            pStatusCharacteristic->setValue(out.c_str());
-            pStatusCharacteristic->notify();
         }
     }
 }

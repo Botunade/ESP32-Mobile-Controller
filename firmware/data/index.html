@@ -66,8 +66,8 @@
             font-weight: 700;
             letter-spacing: -0.04em;
             background: linear-gradient(135deg, #fff 0%, #94a3b8 100%);
-            -webkit-background-clip: text;
             background-clip: text;
+            -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
         }
 
@@ -297,6 +297,17 @@
             animation: pulse 1s infinite;
         }
 
+        /* New AP Mode Badge */
+        .ap-badge {
+            background: var(--warning);
+            color: #000;
+            padding: 4px 8px;
+            border-radius: 8px;
+            font-size: 0.65rem;
+            font-weight: 800;
+            display: none; /* Hidden by default */
+        }
+
         footer {
             text-align: center;
             padding: 24px 0 40px;
@@ -316,6 +327,7 @@
             <div class="status-badge">
                 <div class="status-dot" id="dot"></div>
                 <span id="stTxt">System Offline</span>
+                <span id="apBadge" class="ap-badge">AP MODE</span>
             </div>
         </header>
 
@@ -446,7 +458,7 @@
         </div>
 
         <footer>
-            Tank Controller Pro • v0.4.0 • <span id="pulse">SYNCING</span>
+            Tank Controller Pro • v0.4.5 • <span id="pulse">SYNCING</span>
         </footer>
     </div>
 
@@ -468,6 +480,7 @@
         const el = {
             dot: document.getElementById('dot'),
             st: document.getElementById('stTxt'),
+            apBadge: document.getElementById('apBadge'),
             lvl: document.getElementById('lvl'),
             pmp: document.getElementById('pmp'),
             pulse: document.getElementById('pulse'),
@@ -521,6 +534,7 @@
                 el.dot.classList.remove('online');
                 el.st.innerText = "Connection lost";
                 el.st.style.color = "var(--danger)";
+                el.apBadge.style.display = 'none';
             } else {
                 el.dot.classList.add('online');
                 el.st.innerText = "Secure Link Active";
@@ -540,6 +554,13 @@
                 lastBeat = s.heartbeat;
                 lastBeatTime = Date.now();
                 el.pulse.innerText = `SYNC OK [${Math.round(s.timestamp / 1000)}s]`;
+            }
+
+            // AP Mode Status
+            if (s.ap_mode_active) {
+                el.apBadge.style.display = 'inline-block';
+            } else {
+                el.apBadge.style.display = 'none';
             }
 
             // Real-time Metrics
