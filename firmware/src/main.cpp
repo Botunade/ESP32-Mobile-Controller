@@ -49,6 +49,9 @@ float maxDistanceCm = MAX_DISTANCE_CM;
 // AP Mode Toggle
 bool alwaysOnAp = false;
 
+// Cache for dashboard HTML to avoid repeated LittleFS reads
+String indexHtmlCache = "";
+
 // PID Controller Settings
 float currentKp = PID_KP;
 float currentKi = PID_KI;
@@ -74,10 +77,9 @@ void logSystem(String msg)
         systemLogs.pop_front();
     }
 
-    String logEntry = String(millis() / 1000);
-    logEntry += "s: ";
-    logEntry += msg;
-    systemLogs.push_back(logEntry);
+    char buf[256];
+    snprintf(buf, sizeof(buf), "%lus: %s", millis() / 1000, msg.c_str());
+    systemLogs.push_back(String(buf));
     Serial.println(msg);
 }
 
@@ -232,25 +234,32 @@ float readDistanceCm()
 
 float readDistanceMedian(int samples)
 {
-    std::vector<float> readings;
+    if (samples > 64) samples = 64;
+    float readings[64];
+    int validCount = 0;
+
     for (int i = 0; i < samples; i++)
     {
         float r = readDistanceCm();
         if (r > 0)
-            readings.push_back(r);
-        delay(10);
-    }
-    if (readings.empty())
-        return -1.0f;
-    std::sort(readings.begin(), readings.end());
+            readings[validCount++] = r;
 
-    if (readings.size() % 2 == 0)
+        // Yield to RTOS to keep WiFi/Web stacks responsive
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    if (validCount == 0)
+        return -1.0f;
+
+    std::sort(readings, readings + validCount);
+
+    if (validCount % 2 == 0)
     {
-        return (readings[readings.size() / 2 - 1] + readings[readings.size() / 2]) / 2.0f;
+        return (readings[validCount / 2 - 1] + readings[validCount / 2]) / 2.0f;
     }
     else
     {
-        return readings[readings.size() / 2];
+        return readings[validCount / 2];
     }
 }
 
@@ -302,14 +311,21 @@ void handleOptions()
 
 void handleRoot()
 {
-    File file = LittleFS.open("/index.html", "r");
-    if (!file)
+    if (indexHtmlCache.length() > 0)
     {
-        server.send(500, "text/plain", "Missing Dashboard Image (LittleFS).");
-        return;
+        server.send(200, "text/html", indexHtmlCache);
     }
-    server.streamFile(file, "text/html");
-    file.close();
+    else
+    {
+        File file = LittleFS.open("/index.html", "r");
+        if (!file)
+        {
+            server.send(500, "text/plain", "Missing Dashboard Image (LittleFS).");
+            return;
+        }
+        server.streamFile(file, "text/html");
+        file.close();
+    }
 }
 
 void handleStatus()
@@ -548,6 +564,14 @@ void setup()
 
     if (MDNS.begin("tank-controller"))
         logSystem("DNS Responder Attached");
+
+    // Pre-cache index.html for performance
+    File indexFile = LittleFS.open("/index.html", "r");
+    if (indexFile) {
+        indexHtmlCache = indexFile.readString();
+        indexFile.close();
+        logSystem("Dashboard cached to RAM");
+    }
 
     // 5. Safety Watchdog
     esp_task_wdt_init(WDT_TIMEOUT, true);
