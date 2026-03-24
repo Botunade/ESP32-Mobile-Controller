@@ -40,6 +40,7 @@ bool pumpOn = false;
 float lastLevelPercent = 0.0f;
 float lastPidOutput = 0.0f;
 unsigned long lastControlTimeMs = 0;
+unsigned long bootButtonPressStart = 0;
 
 // Tank Geometry Configuration
 float tankHeightCm = TANK_HEIGHT_CM;
@@ -567,13 +568,20 @@ void loop()
     // Hardware Reset Hook (HOLD BOOT FOR 3S)
     if (digitalRead(0) == LOW)
     {
-        delay(3000);
-        if (digitalRead(0) == LOW)
+        if (bootButtonPressStart == 0)
+        {
+            bootButtonPressStart = millis();
+        }
+        else if (millis() - bootButtonPressStart >= 3000)
         {
             logSystem("LOCAL WIPE COMMAND ACKNOWLEDGED");
             wm.resetSettings();
             ESP.restart();
         }
+    }
+    else
+    {
+        bootButtonPressStart = 0;
     }
 
     unsigned long now = millis();
