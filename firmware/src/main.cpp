@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <cstdio>
 #include <WiFi.h>
 #include <ESPmDNS.h>
 #include <esp_task_wdt.h>
@@ -74,9 +75,9 @@ void logSystem(String msg)
         systemLogs.pop_front();
     }
 
-    String logEntry = String(millis() / 1000);
-    logEntry += "s: ";
-    logEntry += msg;
+    char buf[256];
+    snprintf(buf, sizeof(buf), "%lus: %s", millis() / 1000, msg.c_str());
+    String logEntry(buf);
     systemLogs.push_back(logEntry);
     Serial.println(msg);
 }
