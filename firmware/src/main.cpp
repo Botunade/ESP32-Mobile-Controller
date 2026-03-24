@@ -48,6 +48,7 @@ float maxDistanceCm = MAX_DISTANCE_CM;
 
 // AP Mode Toggle
 bool alwaysOnAp = false;
+String indexHtmlCache;
 
 // PID Controller Settings
 float currentKp = PID_KP;
@@ -302,10 +303,16 @@ void handleOptions()
 
 void handleRoot()
 {
+    if (indexHtmlCache.length() > 0)
+    {
+        server.send(200, "text/html", indexHtmlCache);
+        return;
+    }
+
     File file = LittleFS.open("/index.html", "r");
     if (!file)
     {
-        server.send(500, "text/plain", "Missing Dashboard Image (LittleFS).");
+        server.send(500, "text/plain", "Missing Dashboard Asset (LittleFS).");
         return;
     }
     server.streamFile(file, "text/html");
@@ -423,6 +430,19 @@ void setup()
         Serial.println("[FS] Init Failed, fixing...");
         LittleFS.format();
         LittleFS.begin();
+    }
+
+    // Cache Dashboard HTML for performance
+    File indexFile = LittleFS.open("/index.html", "r");
+    if (indexFile)
+    {
+        indexHtmlCache = indexFile.readString();
+        indexFile.close();
+        logSystem("Dashboard Cached (" + String(indexHtmlCache.length()) + " bytes)");
+    }
+    else
+    {
+        logSystem("CRITICAL: Failed to cache Dashboard");
     }
 
     // 1. Persistence Load
