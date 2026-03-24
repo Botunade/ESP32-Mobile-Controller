@@ -232,25 +232,32 @@ float readDistanceCm()
 
 float readDistanceMedian(int samples)
 {
-    std::vector<float> readings;
+    if (samples <= 0) return -1.0f;
+    const int MAX_SAMPLES = 64;
+    if (samples > MAX_SAMPLES) samples = MAX_SAMPLES;
+
+    float readings[MAX_SAMPLES];
+    int count = 0;
     for (int i = 0; i < samples; i++)
     {
         float r = readDistanceCm();
         if (r > 0)
-            readings.push_back(r);
+            readings[count++] = r;
         delay(10);
     }
-    if (readings.empty())
-        return -1.0f;
-    std::sort(readings.begin(), readings.end());
 
-    if (readings.size() % 2 == 0)
+    if (count == 0)
+        return -1.0f;
+
+    std::sort(readings, readings + count);
+
+    if (count % 2 == 0)
     {
-        return (readings[readings.size() / 2 - 1] + readings[readings.size() / 2]) / 2.0f;
+        return (readings[count / 2 - 1] + readings[count / 2]) / 2.0f;
     }
     else
     {
-        return readings[readings.size() / 2];
+        return readings[count / 2];
     }
 }
 
