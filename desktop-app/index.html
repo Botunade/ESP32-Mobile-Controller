@@ -279,14 +279,19 @@
                  setConnected(true, `Connected to ${ip}`);
                  updateDashboard(data);
                  
-                 // Start polling
-                 state.timer = setInterval(async () => {
+                 // Start polling with recursive setTimeout to prevent request congestion
+                 const poll = async () => {
                      try {
                          const r = await fetch(`http://${ip}/status`);
                          const d = await r.json();
                          updateDashboard(d);
                      } catch(e) { console.log("Poll fail", e); }
-                 }, 1000);
+
+                     if (state.connected) {
+                         state.timer = setTimeout(poll, 1000);
+                     }
+                 };
+                 poll();
 
              } catch (e) {
                  console.error(e);
@@ -330,7 +335,10 @@
         ui.disconnectBtn.addEventListener('click', disconnect);
 
         function disconnect() {
-            if (state.timer) clearInterval(state.timer);
+            if (state.timer) {
+                clearTimeout(state.timer);
+                state.timer = null;
+            }
             if (state.device && state.device.gatt.connected) state.device.gatt.disconnect();
             
             state.connected = false;
