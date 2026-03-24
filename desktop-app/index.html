@@ -280,13 +280,16 @@
                  updateDashboard(data);
                  
                  // Start polling
-                 state.timer = setInterval(async () => {
+                 const poll = async () => {
+                     if (!state.connected) return;
                      try {
                          const r = await fetch(`http://${ip}/status`);
                          const d = await r.json();
                          updateDashboard(d);
                      } catch(e) { console.log("Poll fail", e); }
-                 }, 1000);
+                     state.timer = setTimeout(poll, 1000);
+                 };
+                 state.timer = setTimeout(poll, 1000);
 
              } catch (e) {
                  console.error(e);
@@ -330,7 +333,7 @@
         ui.disconnectBtn.addEventListener('click', disconnect);
 
         function disconnect() {
-            if (state.timer) clearInterval(state.timer);
+            if (state.timer) clearTimeout(state.timer);
             if (state.device && state.device.gatt.connected) state.device.gatt.disconnect();
             
             state.connected = false;
